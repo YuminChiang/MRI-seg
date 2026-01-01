@@ -59,7 +59,316 @@ def draw_predict_mask(base_img, gt_mask, pred_mask):
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     return rgb
 
-def predict_mask(t1_img, t2_img):
+def get_arm_roi(t1, t2):
+    """提取手臂區域 ROI
+    
+    使用 Otsu 自適應閾值對 T1 和 T2 影像進行二值化，
+    融合後通過形態學閉運算填補孔洞，最後提取最大輪廓作為 ROI。
+    
+    Args:
+        t1: T1 加權影像，灰度圖 (H, W)，uint8
+        t2: T2 加權影像，灰度圖 (H, W)，uint8
+    
+    Returns:
+        roi: 手臂區域二值 mask，shape=(H, W)，數值 0 或 255
+    
+    Notes:
+        若未檢測到輪廓，返回全白 mask (255)
+    """
+    # 高斯模糊 + Otsu 閾值
+    t1_blur = cv2.GaussianBlur(t1, (5, 5), 0)
+    t2_blur = cv2.GaussianBlur(t2, (5, 5), 0)
+    _, t1_bin = cv2.threshold(t1_blur, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    _, t2_bin = cv2.threshold(t2_blur, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    
+    # 融合 + 閉運算
+    merged = cv2.bitwise_or(t1_bin, t2_bin)
+    closed = cv2.morphologyEx(merged, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    
+    # 提取最大輪廓
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return np.full_like(t1, 255, dtype=np.uint8)
+    
+    roi = np.zeros_like(t1, dtype=np.uint8)
+    cv2.drawContours(roi, [max(contours, key=cv2.contourArea)], -1, 255, cv2.FILLED)
+    return roi
+
+def filter_by_distance(mask, min_area=30, max_dist=70):
+    """基於質心距離過濾連通組件
+    
+    計算所有組件的加權質心，保留面積大於閾值且距離質心較近的組件，
+    用於去除離群的小雜訊區域。
+    
+    Args:
+        mask: 輸入二值 mask，shape=(H, W)，uint8
+        min_area: 組件最小面積閾值（像素數），默認 30
+        max_dist: 到加權質心的最大歐氏距離，默認 70
+    
+    Returns:
+        result: 過濾後的二值 mask，shape=(H, W)
+        weighted_center: 加權質心座標 (x, y)，若無有效組件則為 None
+    
+    Notes:
+        質心採用面積加權計算，較大組件對質心位置影響更大
+    """
+    num, labels, stats, centroids = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    result = np.zeros_like(mask, dtype=np.uint8)
+    
+    if num <= 1:
+        return result, None
+    
+    # 面積篩選
+    valid_ids = [i for i in range(1, num) if stats[i, cv2.CC_STAT_AREA] >= min_area]
+    if not valid_ids:
+        return result, None
+    
+    # 計算加權質心
+    areas = stats[valid_ids, cv2.CC_STAT_AREA]
+    centers = centroids[valid_ids]
+    total_area = areas.sum()
+    
+    if total_area == 0:
+        return result, None
+    
+    weighted_center = (areas[:, None] * centers).sum(axis=0) / total_area
+    
+    # 距離過濾
+    for idx in valid_ids:
+        if np.linalg.norm(centroids[idx] - weighted_center) <= max_dist:
+            result[labels == idx] = 255
+    
+    return result, weighted_center
+
+def dilate_constrained(mask, ref_t1, ref_t2, iters=1, grad_thresh=40):
+    """執行邊緣約束的條件膨脹
+    
+    結合 T1 和 T2 影像的形態學梯度，定義安全生長區域，
+    在避開強邊緣的前提下進行膨脹，防止跨越組織邊界。
+    
+    Args:
+        mask: 種子區域 mask，shape=(H, W)，uint8
+        ref_t1: T1 參考影像，用於計算梯度，shape=(H, W)，uint8
+        ref_t2: T2 參考影像，用於計算梯度，shape=(H, W)，uint8
+        iters: 膨脹迭代次數，默認 1
+        grad_thresh: 邊緣梯度閾值，梯度大於此值視為邊界，默認 40
+    
+    Returns:
+        current: 膨脹後的 mask，shape=(H, W)，uint8
+    
+    Notes:
+        使用 3x3 結構元素進行膨脹
+        若某次迭代無有效生長則提前終止
+    """
+    kernel = np.ones((3, 3), np.uint8)
+    
+    # 計算梯度並定義安全區
+    grad_t1 = cv2.morphologyEx(ref_t1, cv2.MORPH_GRADIENT, kernel)
+    grad_t2 = cv2.morphologyEx(ref_t2, cv2.MORPH_GRADIENT, kernel)
+    grad_max = cv2.max(grad_t1, grad_t2)
+    _, safe_zone = cv2.threshold(grad_max, grad_thresh, 255, cv2.THRESH_BINARY_INV)
+    
+    # 迭代膨脹
+    current = mask.copy()
+    for _ in range(iters):
+        expanded = cv2.dilate(current, kernel, iterations=1)
+        new_pixels = cv2.bitwise_xor(expanded, current)
+        valid_growth = cv2.bitwise_and(new_pixels, safe_zone)
+        
+        if cv2.countNonZero(valid_growth) == 0:
+            break
+        
+        current = cv2.bitwise_or(current, valid_growth)
+    
+    return current
+
+def remove_small(mask, min_size):
+    """移除面積小於閾值的連通組件
+    
+    Args:
+        mask: 輸入二值 mask，shape=(H, W)，uint8
+        min_size: 最小面積閾值（像素數）
+    
+    Returns:
+        result: 過濾後的 mask，僅保留面積 >= min_size 的組件
+    """
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    result = np.zeros_like(mask, dtype=np.uint8)
+    
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= min_size:
+            result[labels == i] = 255
+    
+    return result
+
+# ==========================================
+# Section 2: CT (腕隧道) 生成
+# ==========================================
+def get_ct_mask(ft_mask, t1, t2, iters=15):
+    """生成腕隧道 (Carpal Tunnel) 分割 mask
+    
+    採用三階段策略：
+    1. 凸包初始化：從 FT mask 的凸包開始
+    2. 引導生長：基於 T1/T2 雙模態特徵構建引導圖，進行受限區域生長
+    3. 幾何平滑：融合凸包和橢圓擬合結果，高斯平滑後二值化
+    
+    Args:
+        ft_mask: 屈指肌腱 (Flexor Tendons) mask，shape=(H, W)，uint8
+        t1: T1 加權影像，灰度圖，shape=(H, W)，uint8
+        t2: T2 加權影像，灰度圖，shape=(H, W)，uint8
+        iters: 區域生長迭代次數，默認 15
+    
+    Returns:
+        result: 腕隧道二值 mask，shape=(H, W)，數值 0 或 255
+    
+    Notes:
+        - T1 引導圖：保留灰度值 40-200 的組織區域，排除脂肪（>200）
+        - T2 引導圖：使用 Otsu 自適應閾值檢測高亮區域
+        - 搜索範圍限制在初始凸包膨脹 35 像素的區域內
+    """
+    # 初始化：FT 凸包
+    pts = cv2.findNonZero(ft_mask)
+    ct = np.zeros_like(ft_mask, dtype=np.uint8)
+    if pts is not None:
+        hull = cv2.convexHull(pts)
+        cv2.drawContours(ct, [hull], -1, 255, cv2.FILLED)
+    
+    # 構建引導圖
+    t1_tissue = cv2.inRange(t1, 40, 200)
+    t2_blur = cv2.GaussianBlur(t2, (5, 5), 0)
+    otsu_val, _ = cv2.threshold(t2_blur, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    _, t2_bright = cv2.threshold(t2_blur, otsu_val * 0.9, 255, cv2.THRESH_BINARY)
+    
+    guide = cv2.bitwise_or(t1_tissue, t2_bright)
+    _, fat = cv2.threshold(t1, 200, 255, cv2.THRESH_BINARY)
+    guide = cv2.bitwise_and(guide, cv2.bitwise_not(fat))
+    guide = cv2.morphologyEx(guide, cv2.MORPH_CLOSE, np.ones((5, 5), np.uint8))
+    
+    # 限制搜索範圍
+    boundary = cv2.dilate(ct, np.ones((35, 35), np.uint8))
+    guide = cv2.bitwise_and(guide, boundary)
+    
+    # 區域生長
+    kernel = np.ones((3, 3), np.uint8)
+    for _ in range(iters):
+        expanded = cv2.dilate(ct, kernel, iterations=1)
+        growth = cv2.bitwise_and(cv2.bitwise_xor(expanded, ct), guide)
+        if cv2.countNonZero(growth) == 0:
+            break
+        ct = cv2.bitwise_or(ct, growth)
+    
+    # 幾何平滑
+    pts = cv2.findNonZero(ct)
+    if pts is None:
+        return ct
+    
+    hull_mask = np.zeros_like(ct, dtype=np.uint8)
+    cv2.drawContours(hull_mask, [cv2.convexHull(pts)], -1, 255, cv2.FILLED)
+    
+    ellipse_mask = np.zeros_like(ct, dtype=np.uint8)
+    if len(pts) >= 5:
+        cv2.ellipse(ellipse_mask, cv2.fitEllipse(pts), 255, cv2.FILLED)
+    else:
+        ellipse_mask = hull_mask.copy()
+    
+    fused = cv2.bitwise_or(hull_mask, ellipse_mask)
+    smoothed = cv2.GaussianBlur(fused, (21, 21), 0)
+    _, result = cv2.threshold(smoothed, 127, 255, cv2.THRESH_BINARY)
+    
+    return result
+
+# ==========================================
+# Section 3: MN (正中神經) 檢測
+# ==========================================
+def get_mn_mask(t2, ct_mask, ft_mask, ref_t1, ref_t2, min_area=50):
+    """檢測正中神經 (Median Nerve) 區域
+    
+    在 CT 內且 FT 外的搜索區域內，使用以下策略檢測 MN：
+    1. 計算 FT 質心作為參考點
+    2. 使用 Otsu 閾值檢測 T2 影像中的亮點候選
+    3. 對候選進行條件膨脹增強
+    4. 基於橢圓擬合度（面積誤差）篩選最佳候選
+    
+    Args:
+        t2: T2 加權影像，灰度圖，shape=(H, W)，uint8
+        ct_mask: 腕隧道 mask，shape=(H, W)，uint8
+        ft_mask: 屈指肌腱 mask，shape=(H, W)，uint8
+        ref_t1: T1 參考影像（用於膨脹邊緣約束），shape=(H, W)，uint8
+        ref_t2: T2 參考影像（用於膨脹邊緣約束），shape=(H, W)，uint8
+        min_area: 候選組件最小面積閾值（膨脹後），默認 50
+    
+    Returns:
+        mn: 正中神經二值 mask，shape=(H, W)，數值 0 或 255
+        debug: 膨脹後的所有候選區域 mask（調試用）
+        ft_center: FT 質心座標 (x, y)
+        best_ell: 最佳橢圓參數 ((cx, cy), (w, h), angle)，無則為 None
+        best_score: 最佳橢圓擬合分數（越低越好），無則為 None
+    
+    Notes:
+        - 橢圓評分公式：|實際面積 - 橢圓面積| / 橢圓面積
+        - 若 FT mask 為空，返回空 mask 和圖像中心作為默認參考點
+        - 條件膨脹參數：迭代 1 次，梯度閾值 90
+    """
+    mn = np.zeros_like(t2, dtype=np.uint8)
+    
+    # 計算 FT 質心
+    num_ft = cv2.connectedComponentsWithStats(ft_mask, connectivity=8)[0]
+    if num_ft <= 1:
+        h, w = t2.shape
+        empty = np.zeros_like(t2, dtype=np.uint8)
+        return mn, empty, (w // 2, h // 2), None, None
+    
+    M = cv2.moments(ft_mask)
+    ft_center = (int(M["m10"] / (M["m00"] + 1e-5)), int(M["m01"] / (M["m00"] + 1e-5)))
+    
+    # 定義搜索區
+    search = cv2.bitwise_and(ct_mask, cv2.bitwise_not(ft_mask))
+    pixels = t2[search > 0]
+    
+    if len(pixels) == 0:
+        return mn, np.zeros_like(t2, dtype=np.uint8), ft_center, None, None
+    
+    # 檢測亮點候選
+    otsu_val, _ = cv2.threshold(pixels, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)
+    _, candidates = cv2.threshold(t2, otsu_val, 255, cv2.THRESH_BINARY)
+    candidates = cv2.bitwise_and(candidates, search)
+    candidates = cv2.morphologyEx(candidates, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+    
+    # 條件膨脹
+    grown = dilate_constrained(candidates, ref_t1, ref_t2, iters=1, grad_thresh=90)
+    debug = grown.copy()
+    
+    # 輪廓分析與橢圓評分
+    contours, _ = cv2.findContours(grown, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    best_cnt, best_ell, best_score = None, None, float('inf')
+    
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area < min_area or len(cnt) < 5:
+            continue
+        
+        ell = cv2.fitEllipse(cnt)
+        w, h = ell[1]
+        ell_area = (np.pi * w * h) / 4.0
+        
+        if ell_area < 1e-6:
+            continue
+        
+        score = abs(area - ell_area) / ell_area
+        
+        if score < best_score:
+            best_score = score
+            best_cnt = cnt
+            best_ell = ell
+    
+    if best_cnt is not None:
+        cv2.drawContours(mn, [best_cnt], -1, 255, cv2.FILLED)
+    
+    return mn, debug, ft_center, best_ell, best_score
+
+
+def predict_mask(t1_img, t2_img, kind=None):
     """
     TODO【影像分割預測實作】
 
@@ -96,10 +405,47 @@ def predict_mask(t1_img, t2_img):
         - 是否確實使用影像資訊進行預測
         - 程式可讀性與穩定性
     """
-    # TODO: 請在此實作你的 segmentation 預測方法
-    raise NotImplementedError("請完成 predict_mask(t1_img, t2_img)")
-
-
+    # 參數配置
+    DARK_THRESH = 30        # FT 暗區閾值
+    MORPH_SIZE = 3          # 形態學結構元素大小
+    
+    FT_MIN_AREA = 20        # FT 最小面積
+    FT_MAX_DIST = 40        # FT 質心最大距離
+    FT_DILATE_ITERS = 2     # FT 膨脹次數
+    FT_GRAD_THRESH = 80     # FT 梯度閾值
+    FT_MIN_SIZE = 50        # FT 最小尺寸
+    
+    CT_GROW_ITERS = 3       # CT 生長迭代次數
+    MN_MIN_AREA = 70        # MN 最小面積
+    
+    # === Stage 1: 屈指肌腱 (FT) 分割 ===
+    arm_roi = get_arm_roi(t1_img, t2_img)
+    
+    # 提取雙模態暗區
+    _, dark_t1 = cv2.threshold(t1_img, DARK_THRESH, 255, cv2.THRESH_BINARY_INV)
+    _, dark_t2 = cv2.threshold(t2_img, DARK_THRESH, 255, cv2.THRESH_BINARY_INV)
+    dark_seeds = cv2.bitwise_and(dark_t1, dark_t2)
+    dark_seeds = cv2.bitwise_and(dark_seeds, arm_roi)
+    
+    # 形態學去噪
+    kernel = np.ones((MORPH_SIZE, MORPH_SIZE), np.uint8)
+    dark_seeds = cv2.morphologyEx(dark_seeds, cv2.MORPH_OPEN, kernel)
+    
+    # 距離過濾 + 條件膨脹 + 移除小組件
+    ft, _ = filter_by_distance(dark_seeds, min_area=FT_MIN_AREA, max_dist=FT_MAX_DIST)
+    ft = dilate_constrained(ft, t1_img, t2_img, iters=FT_DILATE_ITERS, grad_thresh=FT_GRAD_THRESH)
+    ft = remove_small(ft, min_size=FT_MIN_SIZE)
+    
+    # === Stage 2: 腕隧道 (CT) 分割 ===
+    ct = get_ct_mask(ft, t1_img, t2_img, iters=CT_GROW_ITERS)
+    
+    # === Stage 3: 正中神經 (MN) 分割 ===
+    mn, *_ = get_mn_mask(t2_img, ct, ft, t1_img, t2_img, min_area=MN_MIN_AREA)
+    
+    # 返回指定類型的 mask
+    masks = {"FT": ft, "CT": ct, "MN": mn}
+    return (masks.get(kind, ft) > 0).astype(np.uint8)
+    
 def dice_coef(gt, pred):
     """
     gt, pred: 0/1 或 bool mask
@@ -295,7 +641,8 @@ class MainWindow(QMainWindow):
         return files
 
     def load_t1_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select T1 Folder")
+        # folder = QFileDialog.getExistingDirectory(self, "Select T1 Folder")
+        folder = './MRIsample/T1'
         if folder:
             self.t1_images = self.load_folder_images(folder)
             self.idx = 0
@@ -304,7 +651,8 @@ class MainWindow(QMainWindow):
             self.update_base_images()
 
     def load_t2_folder(self):
-        folder = QFileDialog.getExistingDirectory(self, "Select T2 Folder")
+        # folder = QFileDialog.getExistingDirectory(self, "Select T2 Folder")
+        folder = './MRIsample/T2'
         if folder:
             self.t2_images = self.load_folder_images(folder)
             self.idx = 0
@@ -314,7 +662,8 @@ class MainWindow(QMainWindow):
 
     # ---------------- 載入 mask 資料夾 ----------------
     def load_mask_folder(self, kind: str):
-        folder = QFileDialog.getExistingDirectory(self, f"Select {kind} Mask Folder")
+        # folder = QFileDialog.getExistingDirectory(self, f"Select {kind} Mask Folder")
+        folder = f'./MRIsample/{kind}'
         if not folder:
             return
 
@@ -505,7 +854,7 @@ class MainWindow(QMainWindow):
                     t1_img = cv2.resize(t1_img, size)
                     t2_img = cv2.resize(t2_img, size)
 
-                    pred_bin = predict_mask(t1_img, t2_img) # TODO
+                    pred_bin = predict_mask(t1_img, t2_img, kind) # TODO
 
                     d = dice_coef(gt_mask, pred_bin)
                     self.pred_masks[kind].append(pred_bin)
